@@ -665,7 +665,7 @@ async def handle_brain_observe(args: dict[str, Any]) -> str:
         return json.dumps({"action": "deleted", "entity": entity_name})
 
     if action == "list":
-        obs = await db.fetch(
+        observations = await db.fetch(
             "SELECT id, content, observation_type, importance, source, "
             "access_count, last_accessed, version, created_at "
             "FROM brain_observations WHERE entity_id = $1 "
@@ -674,7 +674,7 @@ async def handle_brain_observe(args: dict[str, Any]) -> str:
             "ORDER BY importance DESC",
             entity_id,
         )
-        return db.serialize({"entity": entity_name, "observations": obs})
+        return db.serialize({"entity": entity_name, "observations": observations})
 
     return json.dumps({"error": f"Unknown action: {action}"})
 
@@ -1490,7 +1490,7 @@ async def handle_brain_analytics(args: dict[str, Any]) -> str:
         })
 
     if metric == "drift":
-        from scipy import stats as sp_stats
+        from scipy import stats as sp_stats  # type: ignore[import-untyped]
         row = await db.fetchrow(
             "WITH recent AS ("
             "  SELECT error_type, COUNT(*)::float AS cnt "
