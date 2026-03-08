@@ -1,24 +1,31 @@
-"""Database module: asyncpg connection pool and schema initialization.
+"""Database module v2.0: asyncpg pool + orjson serialization.
 
 Uses DATABASE_URL environment variable for connection.
 Auto-creates the database AND tables on first run.
 Zero manual setup required — fully autonomous.
+
+v2.0 changes:
+- orjson for 5-10x faster serialization with native UUID/datetime
+- Pool tuned: min_size=2, max_size=10, statement_cache_size=512
+- Semaphore increased to 8 concurrent operations
 """
 
 import asyncio
-import json
 import os
 import sys
+from datetime import datetime, date
 from importlib import resources
 from typing import Any
 from urllib.parse import urlparse, urlunparse
+from uuid import UUID
 
 import asyncpg
+import orjson
 
 # Connection pool singleton
 _pool: asyncpg.Pool | None = None
 _pool_lock = asyncio.Lock()
-_semaphore = asyncio.Semaphore(3)  # Max 3 concurrent DB operations
+_semaphore = asyncio.Semaphore(8)  # v2.0: up from 3
 
 
 def _get_admin_url_and_db() -> tuple[str, str]:
@@ -58,24 +65,20 @@ async def _ensure_database_exists() -> None:
     try:
         conn = await asyncpg.connect(admin_url, timeout=10)
     except (OSError, asyncpg.PostgresError) as e:
-        # Can't connect to admin DB — PostgreSQL might not be ready
         print(f"[cuba-memorys] Cannot connect to PostgreSQL: {e}", file=sys.stderr)
         return
 
     try:
-        # Check if database exists
         exists = await conn.fetchval(
             "SELECT 1 FROM pg_database WHERE datname = $1",
             target_db,
         )
         if not exists:
-            # CREATE DATABASE cannot run inside a transaction
             await conn.execute(f'CREATE DATABASE "{target_db}"')
             print(f"[cuba-memorys] Created database '{target_db}'", file=sys.stderr)
         else:
             print(f"[cuba-memorys] Database '{target_db}' OK", file=sys.stderr)
     except asyncpg.DuplicateDatabaseError:
-        # Race condition: another process created it between check and create
         pass
     finally:
         await conn.close()
@@ -85,6 +88,7 @@ async def get_pool() -> asyncpg.Pool:
     """Get or create the connection pool (lazy singleton).
 
     Auto-creates the database if it doesn't exist.
+    v2.0: Tuned pool with statement_cache_size for prepared statements.
 
     Returns:
         asyncpg.Pool: Connection pool.
@@ -100,10 +104,8 @@ async def get_pool() -> asyncpg.Pool:
         if _pool is not None:
             return _pool
 
-        # Step 1: Ensure the database exists
         await _ensure_database_exists()
 
-        # Step 2: Connect to the target database
         database_url = os.environ.get("DATABASE_URL", "")
         if not database_url:
             raise RuntimeError(
@@ -113,9 +115,10 @@ async def get_pool() -> asyncpg.Pool:
 
         _pool = await asyncpg.create_pool(
             database_url,
-            min_size=1,
-            max_size=5,
+            min_size=2,
+            max_size=10,
             command_timeout=30,
+            statement_cache_size=512,
         )
         return _pool
 
@@ -130,7 +133,7 @@ async def init_schema() -> None:
     schema_sql = resources.files("cuba_memorys").joinpath("schema.sql").read_text()
     async with pool.acquire() as conn:
         await conn.execute(schema_sql)
-    print("[cuba-memorys] Schema initialized", file=sys.stderr)
+    print("[cuba-memorys] Schema initialized (v2.0)", file=sys.stderr)
 
 
 async def execute(query: str, *args: Any) -> str:
@@ -207,8 +210,23 @@ async def close() -> None:
         _pool = None
 
 
+def _json_default(obj: Any) -> Any:
+    """Handle types orjson doesn't natively serialize.
+
+    asyncpg returns pgproto.UUID which inherits uuid.UUID but
+    orjson doesn't recognize it. Convert to string.
+    """
+    if isinstance(obj, UUID):
+        return str(obj)
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    raise TypeError(f"Type is not JSON serializable: {type(obj)}")
+
+
 def serialize(obj: Any) -> str:
-    """JSON serialize with UUID/datetime support.
+    """JSON serialize with orjson (5-10x faster, native UUID/datetime).
+
+    Handles asyncpg.pgproto.UUID via default function.
 
     Args:
         obj: Object to serialize.
@@ -216,14 +234,8 @@ def serialize(obj: Any) -> str:
     Returns:
         JSON string.
     """
-    import datetime
-    import uuid
-
-    def _default(o: Any) -> Any:
-        if isinstance(o, uuid.UUID):
-            return str(o)
-        if isinstance(o, (datetime.datetime, datetime.date)):
-            return o.isoformat()
-        raise TypeError(f"Not serializable: {type(o)}")
-
-    return json.dumps(obj, default=_default)
+    return orjson.dumps(
+        obj,
+        default=_json_default,
+        option=orjson.OPT_NON_STR_KEYS | orjson.OPT_NAIVE_UTC,
+    ).decode("utf-8")

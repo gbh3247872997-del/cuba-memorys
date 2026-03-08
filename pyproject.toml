@@ -1,12 +1,26 @@
 [project]
 name = "cuba-memorys"
 version = "1.0.0"
-description = "Compressed Brain MCP: 12-tool knowledge graph with Hebbian learning, hybrid search, error memory, and anti-hallucination grounding. PostgreSQL backend."
+description = "Knowledge graph MCP with Hebbian learning, TF-IDF semantic search, PageRank, contradiction detection, SM-2 spaced repetition, and anti-hallucination grounding. PostgreSQL backend. Created by Leandro Pérez G."
 requires-python = ">=3.11"
-dependencies = ["asyncpg>=0.30.0"]
+dependencies = [
+    "asyncpg>=0.30.0",
+    "orjson>=3.10.0",
+    "scikit-learn>=1.4.0",
+    "networkx>=3.2",
+    "scipy>=1.12.0",
+    "rapidfuzz>=3.6.0",
+]
 license = {text = "CC-BY-NC-4.0"}
 readme = "README.md"
-keywords = ["mcp", "memory", "knowledge-graph", "hebbian", "ai-agent"]
+keywords = ["mcp", "memory", "knowledge-graph", "hebbian", "ai-agent", "anti-hallucination", "pagerank"]
+
+[project.optional-dependencies]
+embeddings = [
+    "onnxruntime>=1.17.0",
+    "huggingface-hub>=0.20.0",
+    "tokenizers>=0.15.0",
+]
 
 [project.scripts]
 cuba-memorys = "cuba_memorys.__main__:main"

@@ -1,4 +1,4 @@
--- Cuba-Memorys: PostgreSQL Schema
+-- Cuba-Memorys v2.0: PostgreSQL Schema
 -- Extensions: pg_trgm (fuzzy), tsvector (full-text). Both built-in since PG 9.1+.
 -- Minimum: PostgreSQL 12 (generated columns).
 
@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS brain_observations (
     source TEXT DEFAULT 'agent'
         CHECK (source IN ('agent', 'error_detection', 'user', 'consolidation', 'inference')),
     source_id TEXT,
+    -- v2.0: Observation versioning (audit trail for corrections)
+    version INT DEFAULT 1,
+    previous_versions JSONB DEFAULT '[]',
     created_at TIMESTAMPTZ DEFAULT NOW(),
     search_vector tsvector GENERATED ALWAYS AS (
         to_tsvector('simple', content)
@@ -51,6 +54,8 @@ CREATE TABLE IF NOT EXISTS brain_relations (
     strength FLOAT DEFAULT 1.0
         CHECK (strength >= 0.0 AND strength <= 1.0),
     bidirectional BOOLEAN DEFAULT FALSE,
+    -- v2.0: Track last traversal for relation learning
+    last_traversed TIMESTAMPTZ DEFAULT NOW(),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(from_entity, to_entity, relation_type)
 );
@@ -103,3 +108,11 @@ CREATE INDEX IF NOT EXISTS idx_errors_project ON brain_errors(project);
 CREATE INDEX IF NOT EXISTS idx_errors_resolved ON brain_errors(resolved);
 CREATE INDEX IF NOT EXISTS idx_relations_from ON brain_relations(from_entity);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON brain_relations(to_entity);
+
+-- v2.0: Migration for existing databases (idempotent ALTER IF NOT EXISTS)
+DO $$ BEGIN
+    ALTER TABLE brain_observations ADD COLUMN IF NOT EXISTS version INT DEFAULT 1;
+    ALTER TABLE brain_observations ADD COLUMN IF NOT EXISTS previous_versions JSONB DEFAULT '[]';
+    ALTER TABLE brain_relations ADD COLUMN IF NOT EXISTS last_traversed TIMESTAMPTZ DEFAULT NOW();
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
