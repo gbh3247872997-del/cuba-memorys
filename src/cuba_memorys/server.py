@@ -3,9 +3,12 @@ import json
 import math
 import signal
 import sys
+import time
+import traceback
 from typing import Any
 
 from cuba_memorys import db, search
+from cuba_memorys.search import rrf_fuse
 from cuba_memorys.hebbian import (
     oja_negative,
     oja_positive,
@@ -569,6 +572,14 @@ async def handle_brain_observe(args: dict[str, Any]) -> str:
             "VALUES ($1, $2, $3, $4) RETURNING id, content, observation_type",
             entity_id, content, obs_type, source,
         )
+        # Persist embedding for pgvector search (if available)
+        if row and db.has_pgvector() and embeddings.is_available():
+            vecs = embeddings.embed([content])
+            if len(vecs) > 0:
+                await db.execute(
+                    "UPDATE brain_observations SET embedding = $1 WHERE id = $2",
+                    vecs[0].tolist(), row["id"],
+                )
         search.cache_clear()
         result: dict[str, Any] = {"action": "added", "observation": row}
         if warnings:
@@ -849,13 +860,13 @@ async def handle_brain_search(args: dict[str, Any]) -> str:
     if cached is not None:
         return db.serialize({"cached": True, "results": cached})
 
-    results: list[dict[str, Any]] = []
+    signal_rankings: list[list[dict[str, Any]]] = []
 
     if scope in ("all", "entities"):
         rows = await db.fetch(search.SEARCH_ENTITIES_SQL, query, limit)
         for r in rows:
             r["_type"] = "entity"
-        results.extend(rows)
+        signal_rankings.append(rows)
 
     if scope in ("all", "observations"):
         rows = await db.fetch(search.SEARCH_OBSERVATIONS_SQL, query, limit)
@@ -863,22 +874,33 @@ async def handle_brain_search(args: dict[str, Any]) -> str:
             r["_type"] = "observation"
             tfidf_sim = tfidf_index.similarity(query, r.get("content", ""))
             r["grounding"] = {
-                "trgm_similarity": round(float(r.get("trgm_similarity", 0)), 3),
-                "tfidf_similarity": round(tfidf_sim, 3),
+                "trgm_similarity": round(float(r.get("trgm_similarity") or 0), 3),
+                "tfidf_similarity": round(float(tfidf_sim or 0), 3),
                 "source": r.get("source", "agent"),
-                "age_days": round(float(r.get("days_since_access", 0)), 1),
+                "age_days": round(float(r.get("days_since_access") or 0), 1),
                 "access_count": r.get("access_count", 0),
             }
-        results.extend(rows)
+        signal_rankings.append(rows)
 
     if scope in ("all", "errors"):
         rows = await db.fetch(search.SEARCH_ERRORS_SQL, query, limit)
         for r in rows:
             r["_type"] = "error"
-        results.extend(rows)
+        signal_rankings.append(rows)
 
-    results.sort(key=lambda x: x.get("score", 0), reverse=True)
-    results = results[:limit]
+    # pgvector: add semantic vector signal when available
+    if db.has_pgvector() and embeddings.is_available() and scope in ("all", "observations"):
+        query_vec = embeddings.embed([query])
+        if len(query_vec) > 0:
+            vec_list = query_vec[0].tolist()
+            vec_rows = await db.fetch(search.SEARCH_VECTOR_SQL, limit, vec_list)
+            for r in vec_rows:
+                r["_type"] = "observation"
+                r["score"] = float(r.get("vector_score", 0))
+            signal_rankings.append(vec_rows)
+
+    # RRF: fuse rankings across signals (Cormack 2009, k=60)
+    results = rrf_fuse(signal_rankings)[:limit]
 
     session = await db.fetchrow(
         "SELECT goals FROM brain_sessions WHERE ended_at IS NULL "
@@ -891,8 +913,41 @@ async def handle_brain_search(args: dict[str, Any]) -> str:
             for r in results:
                 content_lower = r.get("content", r.get("name", "")).lower()
                 if any(kw in content_lower for kw in keywords):
-                    r["score"] = r.get("score", 0) * 1.15
-            results.sort(key=lambda x: x.get("score", 0), reverse=True)
+                    r["rrf_score"] = r.get("rrf_score", 0) * 1.15
+            results.sort(key=lambda x: x.get("rrf_score", 0), reverse=True)
+
+    # GraphRAG: enrich top results with degree-1 neighbors
+    entity_ids = []
+    entity_id_set: set[str] = set()
+    for r in results[:3]:
+        # For observations, use entity_id (FK); for entities, use id (PK)
+        eid = r.get("entity_id") if r.get("_type") == "observation" else r.get("id")
+        if eid and str(eid) not in entity_id_set:
+            entity_ids.append(eid)
+            entity_id_set.add(str(eid))
+    if entity_ids:
+        try:
+            neighbors = await db.fetch(search.NEIGHBORS_SQL, entity_ids)
+            neighbors_by_source: dict[str, list[dict[str, Any]]] = {}
+            for n in neighbors:
+                src = str(n.get("source_entity_id", ""))
+                if src not in neighbors_by_source:
+                    neighbors_by_source[src] = []
+                neighbors_by_source[src].append({
+                    "name": n["name"],
+                    "type": n.get("entity_type", ""),
+                    "relation": n["relation_type"],
+                    "strength": float(n.get("strength", 0)),
+                })
+            for r in results[:3]:
+                eid = str(
+                    r.get("entity_id") if r.get("_type") == "observation"
+                    else r.get("id", ""),
+                )
+                if eid in neighbors_by_source:
+                    r["graph_context"] = neighbors_by_source[eid]
+        except Exception:
+            pass  # GraphRAG enrichment is non-critical
 
     for i, r in enumerate(results):
         if "content" in r:
@@ -1628,6 +1683,7 @@ async def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 },
             }
         except Exception as e:
+            traceback.print_exc(file=sys.stderr)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -1652,6 +1708,85 @@ async def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
 
     return None
 
+# ── REM Sleep: Background Consolidation Daemon ─────────────────────
+_REM_IDLE_SECONDS: float = 900.0  # 15 min of inactivity triggers consolidation
+_rem_running: bool = False
+
+
+async def _rem_consolidation() -> None:
+    """Run background memory consolidation (FSRS decay, prune, pagerank).
+
+    Simulates biological REM sleep: consolidates memories during inactivity.
+    Wilson & McNaughton (1994) — hippocampal replay.
+    """
+    global _rem_running
+    if _rem_running:
+        return
+    _rem_running = True
+    try:
+        print("[cuba-memorys] 💤 REM sleep starting — consolidating memories...",
+              file=sys.stderr)
+
+        # Phase 1: FSRS Decay (Ye 2023)
+        decay_result = await db.execute(
+            "UPDATE brain_observations SET "
+            "importance = GREATEST(0.01, "
+            "  importance * POWER("
+            "    1.0 + EXTRACT(EPOCH FROM (NOW() - last_accessed)) / 86400.0 "
+            "    / (9.0 * GREATEST(stability, 0.1)), -1"
+            "  )) "
+            "WHERE last_accessed < NOW() - INTERVAL '1 day'",
+        )
+        print(f"[cuba-memorys]   ✓ Decay applied: {decay_result}", file=sys.stderr)
+
+        # Phase 2: Prune low-importance, rarely-accessed memories
+        prune_result = await db.execute(
+            "DELETE FROM brain_observations "
+            "WHERE importance < 0.05 AND access_count < 2",
+        )
+        print(f"[cuba-memorys]   ✓ Pruned: {prune_result}", file=sys.stderr)
+
+        # Phase 3: Personalized PageRank recalculation
+        try:
+            import networkx as nx  # type: ignore[import-untyped]
+            g, has_data = await _build_brain_graph(directed=True)
+            if has_data:
+                recent = await db.fetch(
+                    "SELECT name FROM brain_entities "
+                    "ORDER BY updated_at DESC LIMIT 10",
+                )
+                personalization = (
+                    {r["name"]: 1.0 for r in recent if r["name"] in g}
+                    if recent else None
+                )
+                pr = nx.pagerank(
+                    g, alpha=0.85, weight="weight",
+                    personalization=personalization if personalization else None,
+                )
+                for name, pr_score in pr.items():
+                    pr_norm = min(1.0, pr_score * len(pr))
+                    await db.execute(
+                        "UPDATE brain_entities SET "
+                        "importance = LEAST(1.0, 0.6 * $1 + 0.4 * importance), "
+                        "updated_at = NOW() WHERE name = $2",
+                        pr_norm, name,
+                    )
+                print(f"[cuba-memorys]   ✓ PageRank: {len(pr)} entities updated",
+                      file=sys.stderr)
+        except ImportError:
+            print("[cuba-memorys]   ⚠ PageRank skipped (networkx not installed)",
+                  file=sys.stderr)
+
+        search.cache_clear()
+        print("[cuba-memorys] 💤 REM sleep complete — memory optimized",
+              file=sys.stderr)
+    except Exception as e:
+        print(f"[cuba-memorys] ⚠ REM consolidation error: {type(e).__name__}",
+              file=sys.stderr)
+    finally:
+        _rem_running = False
+
+
 async def main() -> None:
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -1663,18 +1798,37 @@ async def main() -> None:
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
 
-    write_transport, write_protocol = await loop.connect_write_pipe(
+    write_transport, _write_protocol = await loop.connect_write_pipe(
         lambda: asyncio.Protocol(), sys.stdout.buffer,
     )
+
+    last_activity = time.monotonic()
+    rem_task: asyncio.Task[None] | None = None
 
     try:
         while not shutdown_event.is_set():
             try:
                 line = await asyncio.wait_for(reader.readline(), timeout=1.0)
             except asyncio.TimeoutError:
+                # Check idle time for REM consolidation
+                idle_seconds = time.monotonic() - last_activity
+                if (
+                    idle_seconds >= _REM_IDLE_SECONDS
+                    and not _rem_running
+                    and (rem_task is None or rem_task.done())
+                ):
+                    rem_task = asyncio.create_task(_rem_consolidation())
+                    last_activity = time.monotonic()  # Reset to avoid re-trigger
                 continue
             if not line:
                 break
+
+            last_activity = time.monotonic()
+
+            # Cancel pending REM task if activity resumes
+            if rem_task is not None and not rem_task.done():
+                rem_task.cancel()
+                rem_task = None
 
             line_str = line.decode("utf-8", errors="replace").strip()
             if not line_str:
@@ -1694,6 +1848,9 @@ async def main() -> None:
     except (ConnectionError, BrokenPipeError, EOFError):
         pass
     finally:
+        # Cancel REM task on shutdown
+        if rem_task is not None and not rem_task.done():
+            rem_task.cancel()
         print("[cuba-memorys] Shutting down gracefully...", file=sys.stderr)
         await db.close()
         write_transport.close()

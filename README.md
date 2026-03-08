@@ -1,8 +1,8 @@
 # 🧠 Cuba-Memorys
 
-**Persistent memory for AI agents** — A Model Context Protocol (MCP) server that gives AI coding assistants long-term memory with a knowledge graph, Hebbian learning, and anti-hallucination grounding.
+**Persistent memory for AI agents** — A Model Context Protocol (MCP) server that gives AI coding assistants long-term memory with a knowledge graph, Hebbian learning, GraphRAG enrichment, and anti-hallucination grounding.
 
-12 tools with Cuban soul. Zero manual setup. Mathematically rigorous.
+12 tools with Cuban soul. Zero manual setup. Mathematically rigorous. **v1.1.0 — God-Tier: RRF fusion, REM Sleep daemon, GraphRAG, conditional pgvector.**
 
 ---
 
@@ -14,15 +14,20 @@ AI agents forget everything between conversations. Cuba-Memorys solves this by g
 - **Error memory** — Never repeat the same mistake twice (anti-repetition guard)
 - **Hebbian learning** — Memories strengthen with use and fade adaptively (FSRS spaced repetition)
 - **Anti-hallucination** — Verify claims against stored knowledge with graduated confidence scoring
-- **Semantic search** — TF-IDF + pg_trgm + RRF fusion + optional BGE embeddings
+- **Semantic search** — 4-signal RRF fusion (TF-IDF + pg_trgm + full-text + optional pgvector HNSW)
+- **GraphRAG** — Top results enriched with degree-1 graph neighbors for topological context
+- **REM Sleep** — Autonomous background consolidation (FSRS decay + prune + PageRank) after 15min idle
 - **Graph intelligence** — Personalized PageRank, Louvain community detection, betweenness centrality
 
 | Feature | Cuba-Memorys | Basic Memory MCPs |
-|---------|:------------:|:-----------------:|
+| ------- | :----------: | :---------------: |
 | Knowledge graph with relations | ✅ | ❌ |
 | Hebbian learning (Oja's rule) | ✅ | ❌ |
 | FSRS adaptive spaced repetition | ✅ | ❌ |
-| TF-IDF + RRF fusion search | ✅ | ❌ |
+| **4-signal RRF fusion search (v1.1)** | ✅ | ❌ |
+| **GraphRAG topological enrichment (v1.1)** | ✅ | ❌ |
+| **REM Sleep autonomous consolidation (v1.1)** | ✅ | ❌ |
+| **Conditional pgvector + HNSW (v1.1)** | ✅ | ❌ |
 | Optional BGE embeddings (ONNX) | ✅ | ❌ |
 | Contradiction detection | ✅ | ❌ |
 | Graduated confidence scoring | ✅ | ❌ |
@@ -109,7 +114,7 @@ Every tool is named after Cuban culture — memorable, professional, and meaning
 
 | Tool | Meaning | Description |
 |------|---------|-------------|
-| `cuba_faro` | **Faro** — lighthouse | Search memory with **hybrid** mode (TF-IDF + full-text + fuzzy + importance + freshness via RRF) or **verify** mode (anti-hallucination — returns `verified` / `partial` / `weak` / `unknown`). Session-aware: boosts results matching active goals. |
+| `cuba_faro` | **Faro** — lighthouse | Search with **4-signal RRF fusion** (TF-IDF + full-text + trigrams + pgvector). **verify** mode for anti-hallucination (returns `verified` / `partial` / `weak` / `unknown`). Top-3 results enriched with **GraphRAG** neighbors. Session-aware: boosts results matching active goals. |
 
 ### Error Memory
 
@@ -165,7 +170,7 @@ tfidf(t, d) = tf(t, d) · log(N / df(t))
 RRF(d) = Σ 1/(k + rank_i(d))     where k = 60
 ```
 
-Reciprocal Rank Fusion combines multiple scoring signals (TF-IDF, full-text, fuzzy, importance, freshness) into a single ranking.
+Reciprocal Rank Fusion combines multiple ranked lists from independent signals into a single robust ranking. In v1.1.0, up to 4 signals are fused: entities (full-text + trigrams), observations (full-text + trigrams + TF-IDF), errors (full-text + trigrams), and optional pgvector (cosine distance on embeddings).
 
 ### Optional BGE Embeddings — BAAI (2023)
 
@@ -176,6 +181,34 @@ similarity: cosine(embed(query), embed(observation))
 ```
 
 Auto-downloads on first use. Falls back to TF-IDF if not installed.
+
+### GraphRAG Enrichment — v1.1.0
+
+Top-3 search results are enriched with degree-1 graph neighbors via a single batched SQL query. Each result gets a `graph_context` array containing neighbor name, entity type, relation type, and Hebbian strength. Provides topological context without N+1 queries.
+
+### REM Sleep Daemon — v1.1.0
+
+After 15 minutes of user inactivity, an autonomous consolidation coroutine runs:
+
+1. **FSRS Decay** — Applies memory decay using Ye (2022) algorithm
+2. **Prune** — Removes low-importance (< 0.1), rarely-accessed observations
+3. **PageRank** — Recalculates personalized importance scores
+
+Cancels immediately on new user activity. Prevents concurrent runs.
+
+### Conditional pgvector — v1.1.0
+
+```
+IF pgvector extension detected:
+  → Migrate embedding column: float4[] → vector(384)
+  → Create HNSW index (m=16, ef_construction=64, vector_cosine_ops)
+  → Add vector cosine distance as 4th RRF signal
+  → Persist embeddings on observation insert
+ELSE:
+  → Graceful degradation: TF-IDF + trigrams (unchanged)
+```
+
+Zero-downtime: auto-detects at startup, no configuration needed.
 
 ### Personalized PageRank — Brin & Page (1998)
 
@@ -229,11 +262,11 @@ cuba-memorys/
 └── src/cuba_memorys/
     ├── __init__.py
     ├── __main__.py             # Entry point
-    ├── server.py               # 12 MCP tool handlers (~1700 LOC)
-    ├── db.py                   # asyncpg pool + orjson + auto-DB creation
-    ├── schema.sql              # 5 tables, 15 indexes, pg_trgm, versioning
+    ├── server.py               # 12 MCP tools + REM Sleep daemon (~1850 LOC)
+    ├── db.py                   # asyncpg pool + orjson + pgvector detection + Decimal
+    ├── schema.sql              # 5 tables, 15+ indexes, pg_trgm, versioning
     ├── hebbian.py              # FSRS, Oja's rule, spreading activation
-    ├── search.py               # LRU cache, RRF fusion, confidence scoring
+    ├── search.py               # LRU cache, RRF fusion, NEIGHBORS_SQL, SEARCH_VECTOR_SQL
     ├── tfidf.py                # TF-IDF semantic search (scikit-learn)
     └── embeddings.py           # Optional BGE embeddings (ONNX Runtime)
 ```
@@ -243,32 +276,27 @@ cuba-memorys/
 | Table | Purpose | Key Features |
 |-------|---------|-------------|
 | `brain_entities` | Knowledge graph nodes | tsvector + pg_trgm indexes, importance ∈ [0,1], FSRS stability/difficulty |
-| `brain_observations` | Facts attached to entities | 9 types, provenance, versioning, temporal validity (valid_from/valid_until) |
+| `brain_observations` | Facts attached to entities | 9 types, provenance, versioning, temporal validity, `vector(384)` embedding (if pgvector) |
 | `brain_relations` | Graph edges | 5 types, bidirectional delete, Hebbian strength |
 | `brain_errors` | Error memory | JSONB context, synapse weight, MTTR tracking |
 | `brain_sessions` | Working sessions | Goals (JSONB), outcome tracking |
 
-### Search Pipeline
+### Search Pipeline (v1.1.0)
 
-Cuba-Memorys uses **Reciprocal Rank Fusion (RRF)** to combine scoring signals:
+Cuba-Memorys uses **Reciprocal Rank Fusion (RRF, k=60)** to combine up to 4 independent ranked signals:
 
-**With embeddings:**
-| Signal | Weight |
-|--------|:------:|
-| BGE embedding cosine similarity | 35% |
-| Full-text search (ts_rank_cd) | 20% |
-| TF-IDF cosine similarity | 15% |
-| Importance (Hebbian-weighted) | 15% |
-| Freshness (recency decay) | 15% |
+| # | Signal | Source | Condition |
+|---|--------|--------|-----------|
+| 1 | Entities (ts_rank + trigrams + importance + freshness) | `brain_entities` | Always |
+| 2 | Observations (ts_rank + trigrams + TF-IDF + importance) | `brain_observations` | Always |
+| 3 | Errors (ts_rank + trigrams + synapse_weight) | `brain_errors` | Always |
+| 4 | **Vector cosine distance (HNSW)** | `brain_observations.embedding` | pgvector installed |
 
-**Without embeddings (TF-IDF fallback):**
-| Signal | Weight |
-|--------|:------:|
-| Full-text search (ts_rank_cd) | 25% |
-| TF-IDF cosine similarity | 25% |
-| Fuzzy matching (pg_trgm) | 20% |
-| Importance | 20% |
-| Freshness | 10% |
+Each signal produces an independent ranking. RRF fuses them: `score(d) = Σ 1/(60 + rank_i(d))`.
+
+**Post-fusion enrichment:**
+- Top-3 results receive **GraphRAG context** (degree-1 neighbors)
+- Active session goals boost matching results by 15%
 
 ### Dependencies
 
@@ -365,26 +393,28 @@ New:       "Project does NOT use PostgreSQL, it uses MySQL instead"
 
 ## Verification
 
-Tested with NEMESIS protocol (3-level) + 18 live integration tests:
+Tested with NEMESIS protocol (3-tier) — v1.1.0 results:
 
 ```
-18/18 integration tests — ZERO DEFECTS
-
-🟢 Normal    — Entity CRUD, observe, search (hybrid + verify), relate (create + traverse),
-                PageRank, communities, decay, find_duplicates, export, health + entropy
-🟡 Pessimist — Nonexistent entities, unknown claims (confidence=0.0), invalid entity types
-🔴 Extreme   — SQL injection, XSS payloads, 10KB content, concurrent creates,
-                Unicode/emoji, bidirectional delete, bounded export
+🟢 Normal (4/4)   — RRF fusion (rrf_score on all results), GraphRAG (graph_context with
+                     neighbors), scope=observations with grounding, verify mode (0.7093)
+🟡 Pessimist (4/4) — Empty queries, whitespace, dedup gate (similarity=1.0),
+                     graph traversal depth=2 with strength decay
+🔴 Extreme (5/5)  — SQL injection, XSS, path traversal, min-length content,
+                     transitive inference depth=5
 ```
+
+Previous v1.0.1 tests (18/18) also verified: Entity CRUD, observe, search, relate, PageRank, communities, decay, find_duplicates, export, health, entropy, Unicode, bidirectional delete.
 
 ### Performance
 
 | Operation | Avg latency |
-|-----------|:----------:|
-| Hybrid search | < 5ms |
+| --------- | :---------: |
+| RRF hybrid search | < 5ms |
 | Analytics | < 2.5ms |
 | Entity CRUD | < 1ms |
 | PageRank (100 entities) | < 50ms |
+| GraphRAG enrichment | < 2ms |
 
 ---
 
@@ -403,4 +433,4 @@ Tested with NEMESIS protocol (3-level) + 18 live integration tests:
 
 ## Credits
 
-Mathematical foundations: Wozniak (1987), Ye (2022, FSRS), Oja (1982), Salton (1975, TF-IDF), Cormack (2009, RRF), Brin & Page (1998, PageRank), Collins & Loftus (1975), Shannon (1948), Pearson (1900, χ²), Blondel et al. (2008, Louvain), BAAI (2023, BGE embeddings).
+Mathematical foundations: Wozniak (1987), Ye (2022, FSRS), Oja (1982), Salton (1975, TF-IDF), Cormack (2009, RRF), Brin & Page (1998, PageRank), Collins & Loftus (1975), Shannon (1948), Pearson (1900, χ²), Blondel et al. (2008, Louvain), BAAI (2023, BGE embeddings), Malkov & Yashunin (2018, HNSW).

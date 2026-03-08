@@ -3,6 +3,7 @@ import os
 import re
 import sys
 from datetime import datetime, date
+from decimal import Decimal
 from importlib import resources
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -16,6 +17,11 @@ _DB_NAME_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
 _pool: asyncpg.Pool | None = None
 _pool_lock = asyncio.Lock()
 _semaphore = asyncio.Semaphore(8)
+_pgvector_available: bool = False
+
+def has_pgvector() -> bool:
+    """Check if pgvector extension is active in the database."""
+    return _pgvector_available
 
 def _get_admin_url_and_db() -> tuple[str, str]:
     url = os.environ.get("DATABASE_URL", "")
@@ -92,11 +98,53 @@ async def get_pool() -> asyncpg.Pool:
         return _pool
 
 async def init_schema() -> None:
+    global _pgvector_available
     pool = await get_pool()
     schema_sql = resources.files("cuba_memorys").joinpath("schema.sql").read_text()
     async with pool.acquire() as conn:
         await conn.execute(schema_sql)
-    print("[cuba-memorys] Schema initialized (v1.0.1)", file=sys.stderr)
+
+        # Detect pgvector extension
+        ext = await conn.fetchval(
+            "SELECT 1 FROM pg_extension WHERE extname = 'vector'",
+        )
+        if ext:
+            _pgvector_available = True
+            # Migrate embedding column from float4[] to vector(384)
+            col_type = await conn.fetchval(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'brain_observations' "
+                "AND column_name = 'embedding'",
+            )
+            if col_type and col_type != "USER-DEFINED":
+                await conn.execute(
+                    "ALTER TABLE brain_observations "
+                    "DROP COLUMN IF EXISTS embedding",
+                )
+                await conn.execute(
+                    "ALTER TABLE brain_observations "
+                    "ADD COLUMN embedding vector(384)",
+                )
+                print("[cuba-memorys] Migrated embedding column to vector(384)",
+                      file=sys.stderr)
+            elif not col_type:
+                await conn.execute(
+                    "ALTER TABLE brain_observations "
+                    "ADD COLUMN IF NOT EXISTS embedding vector(384)",
+                )
+            # HNSW index for cosine similarity
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_obs_embedding_hnsw "
+                "ON brain_observations USING hnsw (embedding vector_cosine_ops) "
+                "WITH (m = 16, ef_construction = 64)",
+            )
+            print("[cuba-memorys] pgvector active — HNSW index ready (384d)",
+                  file=sys.stderr)
+        else:
+            print("[cuba-memorys] pgvector not installed — using TF-IDF + trigrams",
+                  file=sys.stderr)
+
+    print("[cuba-memorys] Schema initialized (v1.1.0)", file=sys.stderr)
 
 async def execute(query: str, *args: Any) -> str:
     async with _semaphore:
@@ -135,6 +183,8 @@ def _json_default(obj: Any) -> Any:
         return str(obj)
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
     raise TypeError(f"Type is not JSON serializable: {type(obj)}")
 
 def serialize(obj: Any) -> str:

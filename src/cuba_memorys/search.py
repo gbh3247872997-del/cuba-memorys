@@ -128,7 +128,7 @@ LIMIT $2
 """
 
 SEARCH_OBSERVATIONS_SQL = """
-SELECT o.id, o.content, o.observation_type, o.importance,
+SELECT o.id, o.entity_id, o.content, o.observation_type, o.importance,
     o.source, o.created_at, o.last_accessed, o.access_count,
     e.name AS entity_name, e.entity_type,
     (
@@ -163,6 +163,43 @@ WHERE search_vector @@ plainto_tsquery('simple', $1)
    OR similarity(error_message, $1) > 0.3
 ORDER BY score DESC
 LIMIT $2
+"""
+
+NEIGHBORS_SQL = """
+SELECT
+    e.name,
+    e.entity_type,
+    r.relation_type,
+    ROUND(r.strength::numeric, 2) AS strength,
+    CASE
+        WHEN r.from_entity = ANY($1::uuid[]) THEN r.from_entity
+        ELSE r.to_entity
+    END AS source_entity_id
+FROM brain_relations r
+JOIN brain_entities e ON (
+    CASE
+        WHEN r.from_entity = ANY($1::uuid[]) THEN r.to_entity
+        ELSE r.from_entity
+    END = e.id
+)
+WHERE r.from_entity = ANY($1::uuid[])
+   OR (r.to_entity = ANY($1::uuid[]) AND r.bidirectional = TRUE)
+ORDER BY r.strength DESC
+LIMIT 30
+"""
+
+SEARCH_VECTOR_SQL = """
+SELECT o.id, o.content, o.observation_type, o.importance,
+    o.source, o.created_at, o.last_accessed, o.access_count,
+    e.name AS entity_name, e.entity_type,
+    1 - (o.embedding <=> $2::vector) AS vector_score
+FROM brain_observations o
+JOIN brain_entities e ON o.entity_id = e.id
+WHERE o.embedding IS NOT NULL
+    AND o.observation_type != 'superseded'
+    AND (o.valid_until IS NULL OR o.valid_until > NOW())
+ORDER BY o.embedding <=> $2::vector
+LIMIT $1
 """
 
 VERIFY_SQL = """
