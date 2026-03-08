@@ -41,7 +41,7 @@ AI agents forget everything between conversations. Cuba-Memorys solves this by g
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USER/cuba-memorys.git
+git clone https://github.com/lENADRO1910/cuba-memorys.git
 cd cuba-memorys
 
 # Start PostgreSQL (auto-creates database + schema)
