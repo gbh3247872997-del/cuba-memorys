@@ -27,9 +27,12 @@ EXPORT_MAX_SESSIONS: int = 500
 # ── REM Sleep Config ────────────────────────────────────────────────
 REM_IDLE_SECONDS: float = 900.0
 
+# ── TF-IDF Config ───────────────────────────────────────────────────
+TFIDF_MAX_CORPUS: int = 50_000
+
 # ── Domain Enums ────────────────────────────────────────────────────
 VALID_ENTITY_TYPES: frozenset[str] = frozenset(
-    {"concept", "project", "technology", "person", "pattern", "config"}
+    {"concept", "project", "technology", "person", "pattern", "config", "system"}
 )
 
 # ── Graph SQL ───────────────────────────────────────────────────────

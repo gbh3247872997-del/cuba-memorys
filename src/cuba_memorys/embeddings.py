@@ -67,7 +67,7 @@ def _ensure_model() -> bool:
         logger.info("Embedding model loaded: BGE-small-en-v1.5 (384d)")
         return True
 
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError) as e:
         logger.warning("Embedding model load failed: %s", e)
         return False
 
@@ -117,3 +117,52 @@ def cosine_sim(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
 
 def is_available() -> bool:
     return _available and _session is not None
+
+
+async def embed_async(texts: list[str]) -> np.ndarray:
+    """Non-blocking embedding via executor (B6 fix).
+
+    ONNX inference is CPU-bound (~10ms). Running it synchronously
+    blocks the async event loop, violating cooperative scheduling.
+    """
+    import asyncio
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, embed, texts)
+
+
+# ── V10: Embedding LRU Cache ───────────────────────────────────────
+# Dedup checks re-embed the same text many times per request.
+# Cache key: first 200 chars (sufficient for uniqueness).
+# Max 256 entries, cleared in REM cycle via clear_cache().
+
+_embed_cache: dict[str, np.ndarray] = {}
+_EMBED_CACHE_MAX: int = 256
+
+
+def embed_cached(text: str) -> np.ndarray:
+    """Cache single-text embedding to avoid redundant ONNX calls.
+
+    Args:
+        text: Text to embed.
+
+    Returns:
+        Embedding vector (384d).
+    """
+    key = text[:200]
+    if key in _embed_cache:
+        return _embed_cache[key]
+    result = embed([text])
+    if result.shape[0] == 0:
+        return np.empty((EMBEDDING_DIM,), dtype=np.float32)
+    vec = result[0]
+    if len(_embed_cache) >= _EMBED_CACHE_MAX:
+        # Evict oldest (first inserted)
+        oldest = next(iter(_embed_cache))
+        del _embed_cache[oldest]
+    _embed_cache[key] = vec
+    return vec
+
+
+def clear_cache() -> None:
+    """Clear embedding cache. Called in REM sleep cycle."""
+    _embed_cache.clear()

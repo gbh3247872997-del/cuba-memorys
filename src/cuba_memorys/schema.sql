@@ -90,6 +90,10 @@ CREATE INDEX IF NOT EXISTS idx_errors_project ON brain_errors(project);
 CREATE INDEX IF NOT EXISTS idx_errors_resolved ON brain_errors(resolved);
 CREATE INDEX IF NOT EXISTS idx_relations_from ON brain_relations(from_entity);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON brain_relations(to_entity);
+-- V8: Partial index for temporal validity filter in SEARCH_OBSERVATIONS_SQL
+CREATE INDEX IF NOT EXISTS idx_obs_valid_until
+    ON brain_observations(valid_until)
+    WHERE valid_until IS NOT NULL;
 DO $$ BEGIN
     ALTER TABLE brain_observations ADD COLUMN IF NOT EXISTS version INT DEFAULT 1;
     ALTER TABLE brain_observations ADD COLUMN IF NOT EXISTS previous_versions JSONB DEFAULT '[]';

@@ -3,16 +3,41 @@ import time
 from typing import Any
 
 RRF_K: int = 60  # Cormack (2009) standard constant
+DEDUP_OVERLAP: float = 0.75  # V2: word-overlap threshold for semantic dedup
 
 
-def rrf_fuse(signal_rankings: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+def _text_overlap(a: str, b: str) -> float:
+    """Word-overlap ratio between two texts.
+
+    Jaccard-like but uses min(len) as denominator to catch
+    subset matches (e.g. entity name inside observation content).
+
+    Returns:
+        Overlap ratio in [0, 1].
+    """
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = len(words_a & words_b)
+    return intersection / min(len(words_a), len(words_b))
+
+
+def rrf_fuse(
+    signal_rankings: list[list[dict[str, Any]]],
+    dedup_threshold: float = DEDUP_OVERLAP,
+) -> list[dict[str, Any]]:
     """Reciprocal Rank Fusion across N ranked signal lists.
+
+    V2: Post-fusion dedup removes semantic duplicates that appear
+    across entity and observation signals (Cormack 2009 + dedup).
 
     Args:
         signal_rankings: List of ranked result lists from different signals.
+        dedup_threshold: Word-overlap threshold for dedup (default 0.75).
 
     Returns:
-        Fused results sorted by RRF score.
+        Fused, deduplicated results sorted by RRF score.
     """
     scores: dict[str, float] = {}
     items: dict[str, dict[str, Any]] = {}
@@ -23,9 +48,20 @@ def rrf_fuse(signal_rankings: list[list[dict[str, Any]]]) -> list[dict[str, Any]
             if key not in items:
                 items[key] = item
     sorted_keys = sorted(scores, key=scores.__getitem__, reverse=True)
-    return [
+    fused = [
         {**items[k], "rrf_score": round(scores[k], 4)} for k in sorted_keys
     ]
+    # V2: Remove semantic duplicates from fused results
+    unique: list[dict[str, Any]] = []
+    for item in fused:
+        content = item.get("content", item.get("name", ""))
+        if not any(
+            _text_overlap(content, u.get("content", u.get("name", "")))
+            > dedup_threshold
+            for u in unique
+        ):
+            unique.append(item)
+    return unique
 
 _cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
 CACHE_TTL: float = 60.0
@@ -75,24 +111,45 @@ def compute_confidence(
     importance: float,
     freshness_days: float,
     embedding_score: float | None = None,
+    access_count: int = 0,
 ) -> tuple[float, str]:
+    """Compute grounding confidence from multiple signals.
+
+    V4: access_count adaptively boosts importance weight.
+    Observations accessed ≥10 times saturate the boost.
+
+    Args:
+        trgm_score: Trigram similarity [0, 1].
+        tfidf_score: TF-IDF similarity [0, 1].
+        importance: Observation importance [0, 1].
+        freshness_days: Days since last access.
+        embedding_score: Optional embedding cosine similarity.
+        access_count: Times this observation was accessed.
+
+    Returns:
+        Tuple of (score, level).
+    """
     freshness = 1.0 / (1.0 + freshness_days / 30.0)
+
+    # V4: Adaptive importance weight — frequently accessed = more trustworthy
+    recall_factor = min(1.0, access_count / 10.0)
+    adaptive_importance_w = 0.10 + 0.10 * recall_factor  # 0.10 → 0.20
 
     if embedding_score is not None:
         score = (
             0.30 * embedding_score
             + 0.25 * trgm_score
             + 0.20 * tfidf_score
-            + 0.15 * importance
-            + 0.10 * freshness
+            + adaptive_importance_w * importance
+            + (0.15 - adaptive_importance_w + 0.10) * freshness
         )
     else:
         score = (
             0.30 * trgm_score
             + 0.25 * tfidf_score
             + 0.20 * (trgm_score * tfidf_score) ** 0.5
-            + 0.15 * importance
-            + 0.10 * freshness
+            + adaptive_importance_w * importance
+            + (0.15 - adaptive_importance_w + 0.10) * freshness
         )
 
     score = max(0.0, min(1.0, score))

@@ -23,6 +23,11 @@ class TFIDFIndex:
             self._corpus = []
             return
 
+        # TD8: Cap corpus size to prevent unbounded memory growth
+        from cuba_memorys.constants import TFIDF_MAX_CORPUS
+        if len(corpus) > TFIDF_MAX_CORPUS:
+            corpus = corpus[-TFIDF_MAX_CORPUS:]
+
         self._corpus = corpus
         self._matrix = self._vectorizer.fit_transform(corpus)
         self._fitted = True

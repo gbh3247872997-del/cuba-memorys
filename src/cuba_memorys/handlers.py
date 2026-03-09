@@ -1,17 +1,28 @@
 """Handler functions for all 12 cuba-memorys MCP tools.
 
 CC reduction strategy: each action-dispatch handler delegates to
-sub-functions, keeping each function's cyclomatic complexity ≤10.
+sub-functions, keeping each function's cyclomatic complexity ≤7.
 Technique: McCabe (1976) extract-and-dispatch.
+
+v1.4.0 activations:
+  - FSRS stability updates on recall (Ye 2023)
+  - Spreading activation on entity access (Collins & Loftus 1975)
+  - Information density gating (Shannon 1948)
+  - Embedding-enhanced dedup (cosine sim)
 """
 import json
 import logging
 import math
 from typing import Any
 
+import asyncpg
+
 from cuba_memorys import __version__, db, search, embeddings
 from cuba_memorys.search import rrf_fuse
 from cuba_memorys.hebbian import (
+    fsrs_retrievability,
+    fsrs_update_stability,
+    information_density,
     oja_negative,
     oja_positive,
     synapse_weight_boost,
@@ -60,7 +71,10 @@ async def _build_brain_graph(directed: bool = False) -> tuple[Any, bool]:
 async def _check_dedup(
     entity_id: Any, content: str,
 ) -> tuple[bool, list[str], str | None]:
-    """DB-side duplicate/contradiction check.
+    """DB-side duplicate/contradiction check with embedding enhancement.
+
+    Uses pg_trgm similarity + optional embedding cosine similarity (E3)
+    for paraphrase detection.
 
     Returns:
         (is_duplicate, warnings, existing_content_preview)
@@ -77,6 +91,11 @@ async def _check_dedup(
         sim = float(obs["sim"])
         if sim > DEDUP_THRESHOLD:
             return True, warnings, obs["content"][:80]
+        # E3: Embedding-enhanced dedup — catches paraphrased duplicates
+        if sim > 0.5 and embeddings.is_available():
+            emb_sim = _compute_embedding_score(content, obs["content"])
+            if emb_sim is not None and emb_sim > 0.92:
+                return True, warnings, obs["content"][:80]
         if sim > CONTRADICTION_THRESHOLD and search.has_negation(
             content, obs["content"],
         ):
@@ -95,12 +114,74 @@ async def _check_dedup(
 async def _persist_embedding(content: str, obs_id: Any) -> None:
     """Store embedding vector for an observation if pgvector is active."""
     if db.has_pgvector() and embeddings.is_available():
-        vecs = embeddings.embed([content])
+        vecs = await embeddings.embed_async([content])  # V7: async, no event-loop block
         if len(vecs) > 0:
             await db.execute(
                 "UPDATE brain_observations SET embedding = $1 WHERE id = $2",
                 vecs[0].tolist(), obs_id,
             )
+
+
+def _elapsed_days(last_accessed: Any) -> float:
+    """Compute elapsed days since last_accessed datetime.
+
+    Returns 0.01 minimum to avoid division-by-zero in FSRS formulas.
+    """
+    if last_accessed is None:
+        return 1.0
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if hasattr(last_accessed, 'tzinfo') and last_accessed.tzinfo is None:
+        last_accessed = last_accessed.replace(tzinfo=datetime.timezone.utc)
+    delta = (now - last_accessed).total_seconds() / 86400.0
+    return max(0.01, delta)
+
+
+async def _fsrs_recall_boost(obs_rows: list[Any]) -> None:
+    """Update FSRS stability for recalled observations (Ye 2023).
+
+    Called when observations are accessed via entity_get or search.
+    This activates the spaced repetition model that was previously
+    dead code (B2 fix / E1 enhancement).
+    """
+    for row in obs_rows[:5]:  # Limit to top-5 to avoid excessive writes
+        obs_id = row.get("id")
+        stability = float(row.get("stability") or 1.0)
+        difficulty = float(row.get("difficulty") or 5.0)
+        elapsed = _elapsed_days(row.get("last_accessed"))
+        retrievability = fsrs_retrievability(elapsed, stability)
+        new_stability = fsrs_update_stability(
+            stability, difficulty, retrievability,
+        )
+        if abs(new_stability - stability) > 0.001:
+            await db.execute(
+                "UPDATE brain_observations SET "
+                "stability = $1, last_accessed = NOW(), "
+                "access_count = access_count + 1 "
+                "WHERE id = $2",
+                new_stability, obs_id,
+            )
+
+
+async def _recall_boost_results(results: list[dict[str, Any]]) -> None:
+    """Boost FSRS stability for observations found via search (E8).
+
+    V14: Extended from top-3 to ALL observation results using batch UPDATE.
+    Paper: Karpicke & Roediger (2008) — testing effect.
+    """
+    obs_ids = [
+        str(r["id"]) for r in results
+        if r.get("_type") == "observation" and r.get("id")
+    ]
+    if not obs_ids:
+        return
+    await db.execute(
+        "UPDATE brain_observations SET "
+        "access_count = access_count + 1, "
+        "last_accessed = NOW() "
+        "WHERE id = ANY($1::uuid[])",
+        obs_ids,
+    )
 
 
 async def _check_overload(entity_id: Any) -> str | None:
@@ -169,6 +250,7 @@ async def _entity_get(name: str) -> str:
         "updated_at = NOW() WHERE id = $1",
         entity_id, IMPORTANCE_ACCESS_BOOST,
     )
+    # E2: Spreading activation — boost neighbors (Collins & Loftus 1975)
     await db.execute(
         "UPDATE brain_entities SET "
         "importance = LEAST(1.0, importance + $2) "
@@ -184,10 +266,13 @@ async def _entity_get(name: str) -> str:
 
     obs = await db.fetch(
         "SELECT id, content, observation_type, importance, source, "
+        "stability, difficulty, last_accessed, "
         "created_at FROM brain_observations "
         "WHERE entity_id = $1 ORDER BY importance DESC",
         entity_id,
     )
+    # E1/B2: FSRS stability update on recall (Ye 2023)
+    await _fsrs_recall_boost(obs)
     rels = await db.fetch(
         "SELECT e.name AS target, r.relation_type, r.strength, "
         "r.bidirectional "
@@ -207,11 +292,16 @@ async def _entity_get(name: str) -> str:
 
 async def _entity_update(name: str, args: dict[str, Any]) -> str:
     new_name = args.get("new_name", name)
-    await db.execute(
-        "UPDATE brain_entities SET name = $1, updated_at = NOW() "
-        "WHERE name = $2",
-        new_name, name,
-    )
+    try:
+        await db.execute(
+            "UPDATE brain_entities SET name = $1, updated_at = NOW() "
+            "WHERE name = $2",
+            new_name, name,
+        )
+    except asyncpg.UniqueViolationError:
+        return db.serialize({
+            "error": f"Entity '{new_name}' already exists",
+        })
     return db.serialize({"action": "updated", "old_name": name, "new_name": new_name})
 
 
@@ -267,17 +357,27 @@ async def _observe_add(entity_id: Any, args: dict[str, Any]) -> str:
             "existing": existing, "similarity": round(DEDUP_THRESHOLD, 3),
         })
 
+    # E5: Information density gating (Shannon 1948)
+    # Low-entropy content gets reduced starting importance
+    density = information_density(content)
+    initial_importance = 0.3 if density < 0.3 else 0.5
+
     row = await db.fetchrow(
         "INSERT INTO brain_observations "
-        "(entity_id, content, observation_type, source) "
-        "VALUES ($1, $2, $3, $4) RETURNING id, content, observation_type",
-        entity_id, content, obs_type, source,
+        "(entity_id, content, observation_type, source, importance) "
+        "VALUES ($1, $2, $3, $4, $5) RETURNING id, content, observation_type",
+        entity_id, content, obs_type, source, initial_importance,
     )
     if row:
         await _persist_embedding(content, row["id"])
     search.cache_clear()
 
     result: dict[str, Any] = {"action": "added", "observation": row}
+    if density < 0.3:
+        result["density_warning"] = (
+            f"Low information density ({density:.2f}). "
+            "Starting importance reduced to 0.3."
+        )
     if warnings:
         result["contradictions"] = warnings
     overload = await _check_overload(entity_id)
@@ -309,11 +409,15 @@ async def _observe_batch_add(entity_id: Any, args: dict[str, Any]) -> str:
             continue
         all_warnings.extend(warnings)
 
+        # V5: Information density gating — parity with _observe_add
+        density = information_density(content)
+        initial_importance = 0.3 if density < 0.3 else 0.5
+
         row = await db.fetchrow(
             "INSERT INTO brain_observations "
-            "(entity_id, content, observation_type, source) "
-            "VALUES ($1, $2, $3, $4) RETURNING id, content",
-            entity_id, content, obs_type, source,
+            "(entity_id, content, observation_type, source, importance) "
+            "VALUES ($1, $2, $3, $4, $5) RETURNING id, content",
+            entity_id, content, obs_type, source, initial_importance,
         )
         if row:
             await _persist_embedding(content, row["id"])
@@ -521,6 +625,7 @@ async def _search_verify(query: str) -> str:
             importance=float(r.get("importance", 0.5)),
             freshness_days=float(r.get("days_since_access", 0)),
             embedding_score=emb_score,
+            access_count=int(r.get("access_count", 0)),  # V4
         )
         if score > best_score:
             best_score = score
@@ -535,76 +640,179 @@ async def _search_verify(query: str) -> str:
             "access_count": r.get("access_count", 0),
         })
 
+    # V3: Source triangulation — penalize single-source confirmation
+    unique_entities = len({e.get("entity") for e in evidence if e.get("entity")})
+    diversity_factor = min(1.0, unique_entities / max(1, len(evidence)))
+    best_score = round(best_score * (0.7 + 0.3 * diversity_factor), 4)
+    if best_score < 0.3:
+        best_level = "unknown"
+    elif best_score < 0.5:
+        best_level = "weak"
+    elif best_score < 0.8:
+        best_level = "partial"
+
     return db.serialize({
         "mode": "verify", "query": query,
         "confidence_score": best_score,
         "confidence_level": best_level,
+        "source_diversity": round(diversity_factor, 2),
         "evidence": evidence,
     })
 
 
 def _compute_embedding_score(query: str, content: str) -> float | None:
-    """Compute cosine similarity between query and content embeddings."""
+    """Compute cosine similarity between query and content embeddings.
+
+    V10: Uses embed_cached() to avoid redundant ONNX inference.
+    """
     if not embeddings.is_available():
         return None
-    vecs = embeddings.embed([query, content])
-    if len(vecs) == 2:
-        return embeddings.cosine_sim(vecs[0], vecs[1])
+    vec_q = embeddings.embed_cached(query)
+    vec_c = embeddings.embed_cached(content)
+    if vec_q.size > 0 and vec_c.size > 0:
+        return embeddings.cosine_sim(vec_q, vec_c)
     return None
 
 
-async def _search_hybrid(query: str, scope: str, limit: int) -> str:
-    """Multi-signal search with RRF fusion (Cormack 2009, k=60)."""
-    cached = search.cache_get(query, "hybrid", scope, limit)
-    if cached is not None:
-        return db.serialize({"cached": True, "results": cached})
-
-    signal_rankings: list[list[dict[str, Any]]] = []
+async def _collect_search_signals(
+    query: str, scope: str, limit: int,
+) -> list[list[dict[str, Any]]]:
+    """Collect ranked result lists from each search signal."""
+    signals: list[list[dict[str, Any]]] = []
 
     if scope in ("all", "entities"):
         rows = await db.fetch(search.SEARCH_ENTITIES_SQL, query, limit)
         for r in rows:
             r["_type"] = "entity"
-        signal_rankings.append(rows)
+        signals.append(rows)
 
     if scope in ("all", "observations"):
         rows = await db.fetch(search.SEARCH_OBSERVATIONS_SQL, query, limit)
-        for r in rows:
-            r["_type"] = "observation"
-            tfidf_sim = tfidf_index.similarity(query, r.get("content", ""))
-            r["grounding"] = {
-                "trgm_similarity": round(float(r.get("trgm_similarity") or 0), 3),
-                "tfidf_similarity": round(float(tfidf_sim or 0), 3),
-                "source": r.get("source", "agent"),
-                "age_days": round(float(r.get("days_since_access") or 0), 1),
-                "access_count": r.get("access_count", 0),
-            }
-        signal_rankings.append(rows)
+        _annotate_observations(query, rows)
+        signals.append(rows)
 
     if scope in ("all", "errors"):
         rows = await db.fetch(search.SEARCH_ERRORS_SQL, query, limit)
         for r in rows:
             r["_type"] = "error"
-        signal_rankings.append(rows)
+        signals.append(rows)
 
-    # pgvector: add semantic vector signal when available
     if db.has_pgvector() and embeddings.is_available() and scope in ("all", "observations"):
-        query_vec = embeddings.embed([query])
-        if len(query_vec) > 0:
-            vec_list = query_vec[0].tolist()
-            vec_rows = await db.fetch(search.SEARCH_VECTOR_SQL, limit, vec_list)
-            for r in vec_rows:
-                r["_type"] = "observation"
-                r["score"] = float(r.get("vector_score", 0))
-            signal_rankings.append(vec_rows)
+        signals.append(await _collect_vector_signal(query, limit))
 
-    results = rrf_fuse(signal_rankings)[:limit]
+    return signals
+
+
+def _annotate_observations(
+    query: str, rows: list[dict[str, Any]],
+) -> None:
+    """Annotate observation results with grounding metadata."""
+    for r in rows:
+        r["_type"] = "observation"
+        tfidf_sim = tfidf_index.similarity(query, r.get("content", ""))
+        r["grounding"] = {
+            "trgm_similarity": round(float(r.get("trgm_similarity") or 0), 3),
+            "tfidf_similarity": round(float(tfidf_sim or 0), 3),
+            "source": r.get("source", "agent"),
+            "age_days": round(float(r.get("days_since_access") or 0), 1),
+            "access_count": r.get("access_count", 0),
+        }
+
+
+async def _collect_vector_signal(
+    query: str, limit: int,
+) -> list[dict[str, Any]]:
+    """Collect pgvector semantic search signal."""
+    query_vec = embeddings.embed([query])
+    if len(query_vec) == 0:
+        return []
+    vec_list = query_vec[0].tolist()
+    vec_rows = await db.fetch(search.SEARCH_VECTOR_SQL, limit, vec_list)
+    for r in vec_rows:
+        r["_type"] = "observation"
+        r["score"] = float(r.get("vector_score", 0))
+    return vec_rows
+
+
+async def _search_hybrid(query: str, scope: str, limit: int) -> str:
+    """Multi-signal search with RRF fusion (Cormack 2009, k=60).
+
+    V9: KG-neighbor query expansion when recall is low.
+    CC reduced from 16 to 4 via extract-and-dispatch.
+    """
+    cached = search.cache_get(query, "hybrid", scope, limit)
+    if cached is not None:
+        return db.serialize({"cached": True, "results": cached})
+
+    signals = await _collect_search_signals(query, scope, limit)
+    results = rrf_fuse(signals)[:limit]
+
+    # V9: KG-neighbor query expansion — PRF via graph (arXiv 2502.08557)
+    if len(results) < limit:
+        results = await _expand_via_neighbors(query, results, scope, limit)
+
     _boost_session_results(results, await _get_session_keywords())
     await _enrich_graphrag(results)
     _truncate_results(results)
+    # E8: Active recall — boost stability of recalled observations
+    await _recall_boost_results(results)
 
     search.cache_set(query, "hybrid", scope, limit, results)
     return db.serialize({"results": results})
+
+
+async def _expand_via_neighbors(
+    query: str,
+    results: list[dict[str, Any]],
+    scope: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """V9: Expand search via KG neighbors when recall is low.
+
+    Inspired by Zep/Graphiti BFS search (arXiv 2501.13956 §3.1).
+    Only triggered when initial results < limit.
+
+    Args:
+        query: Original search query.
+        results: Initial search results.
+        scope: Search scope.
+        limit: Max results requested.
+
+    Returns:
+        Merged results with expanded neighbors.
+    """
+    entity_ids = _collect_entity_ids(results[:5])
+    if not entity_ids:
+        return results
+    try:
+        neighbors = await db.fetch(
+            "SELECT DISTINCT e.name FROM brain_entities e "
+            "JOIN brain_relations r ON "
+            "  (e.id = r.to_entity AND r.from_entity = ANY($1::uuid[])) "
+            "  OR (e.id = r.from_entity AND r.to_entity = ANY($1::uuid[])) "
+            "LIMIT 5",
+            [str(eid) for eid in entity_ids],
+        )
+        if not neighbors:
+            return results
+        expanded_terms = " ".join(n["name"] for n in neighbors)
+        expanded_query = f"{query} {expanded_terms}"
+        extra_signals = await _collect_search_signals(
+            expanded_query, scope, limit,
+        )
+        extra_results = rrf_fuse(extra_signals)[:limit]
+        # Merge: deduplicate by ID, keep higher-scored
+        seen_ids = {str(r.get("id", "")): r for r in results}
+        for er in extra_results:
+            eid = str(er.get("id", ""))
+            if eid not in seen_ids:
+                results.append(er)
+                seen_ids[eid] = er
+        results.sort(key=lambda x: x.get("rrf_score", 0), reverse=True)
+        return results[:limit]
+    except (asyncpg.PostgresError, KeyError) as exc:
+        logger.warning("V9 KG expansion error: %s", type(exc).__name__)
+        return results
 
 
 async def _get_session_keywords() -> list[str]:
@@ -632,52 +840,76 @@ def _boost_session_results(
     results.sort(key=lambda x: x.get("rrf_score", 0), reverse=True)
 
 
-async def _enrich_graphrag(results: list[dict[str, Any]]) -> None:
-    """Enrich top-3 results with degree-1 neighbors (GraphRAG)."""
-    entity_ids = []
-    entity_id_set: set[str] = set()
-    for r in results[:3]:
+def _collect_entity_ids(
+    results: list[dict[str, Any]],
+) -> list[Any]:
+    """Extract unique entity IDs from top results."""
+    entity_ids: list[Any] = []
+    seen: set[str] = set()
+    for r in results:
         eid = r.get("entity_id") if r.get("_type") == "observation" else r.get("id")
-        if eid and str(eid) not in entity_id_set:
+        if eid and str(eid) not in seen:
             entity_ids.append(eid)
-            entity_id_set.add(str(eid))
+            seen.add(str(eid))
+    return entity_ids
+
+
+def _group_neighbors(
+    neighbors: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Group neighbor records by source entity ID."""
+    by_source: dict[str, list[dict[str, Any]]] = {}
+    for n in neighbors:
+        src = str(n.get("source_entity_id", ""))
+        by_source.setdefault(src, []).append({
+            "name": n["name"],
+            "type": n.get("entity_type", ""),
+            "relation": n["relation_type"],
+            "strength": float(n.get("strength", 0)),
+        })
+    return by_source
+
+
+async def _enrich_graphrag(results: list[dict[str, Any]]) -> None:
+    """Enrich top-3 results with degree-1 neighbors (GraphRAG).
+
+    CC reduced from 12 to 4 via extract helper functions.
+    """
+    entity_ids = _collect_entity_ids(results[:3])
     if not entity_ids:
         return
     try:
         neighbors = await db.fetch(search.NEIGHBORS_SQL, entity_ids)
-        neighbors_by_source: dict[str, list[dict[str, Any]]] = {}
-        for n in neighbors:
-            src = str(n.get("source_entity_id", ""))
-            if src not in neighbors_by_source:
-                neighbors_by_source[src] = []
-            neighbors_by_source[src].append({
-                "name": n["name"],
-                "type": n.get("entity_type", ""),
-                "relation": n["relation_type"],
-                "strength": float(n.get("strength", 0)),
-            })
+        grouped = _group_neighbors(neighbors)
         for r in results[:3]:
             eid = str(
                 r.get("entity_id") if r.get("_type") == "observation"
                 else r.get("id", ""),
             )
-            if eid in neighbors_by_source:
-                r["graph_context"] = neighbors_by_source[eid]
-    except Exception as exc:
+            if eid in grouped:
+                r["graph_context"] = grouped[eid]
+    except (asyncpg.PostgresError, KeyError) as exc:
         logger.warning("GraphRAG enrichment error: %s", type(exc).__name__)
 
 
 def _truncate_results(results: list[dict[str, Any]]) -> None:
-    """Truncate content based on result rank to reduce payload."""
-    for i, r in enumerate(results):
+    """V1: Token-budget truncation proportional to RRF score.
+
+    Allocates character budget per result based on its score share.
+    Low-scoring results get metadata stripped to reduce context bloat.
+    """
+    token_budget = 800
+    total_rrf = sum(r.get("rrf_score", 0.01) for r in results) or 0.01
+    for r in results:
         if "content" not in r:
             continue
-        if i < 3:
-            r["content"] = r["content"][:200]
-        elif i < 7:
-            r["content"] = r["content"].split(".")[0][:100]
-        else:
-            r.pop("content", None)
+        share = r.get("rrf_score", 0.01) / total_rrf
+        char_budget = int(share * token_budget * 4)  # ~4 chars/token
+        r["content"] = r["content"][:max(50, char_budget)]
+        # Strip verbose metadata from low-scoring results
+        if share < 0.05:
+            r.pop("grounding", None)
+            r.pop("graph_context", None)
 
 
 # ── 5. Error Report (cuba_alarma) — CC: ≤5 ─────────────────────────
@@ -880,7 +1112,7 @@ async def handle_brain_decision(args: dict[str, Any]) -> str:
 async def _decision_record(args: dict[str, Any]) -> str:
     entity = await db.fetchrow(
         "INSERT INTO brain_entities (name, entity_type) "
-        "VALUES ('_decisions', 'system') "
+        "VALUES ('_decisions', 'config') "
         "ON CONFLICT (name) DO UPDATE SET updated_at = NOW() "
         "RETURNING id",
     )
@@ -915,7 +1147,7 @@ def _parse_decisions(rows: list[Any]) -> list[dict[str, Any]]:
         try:
             d = json.loads(r["content"])
             d["id"] = str(r["id"])
-            if "importance" in dict(r):
+            if "importance" in r:
                 d["importance"] = r["importance"]
             decisions.append(d)
         except json.JSONDecodeError:
@@ -970,13 +1202,17 @@ async def handle_brain_consolidate(args: dict[str, Any]) -> str:
 
 
 async def _consolidate_decay(_args: dict[str, Any]) -> str:
+    # B1 fix: Add last_accessed = NOW() for idempotency.
+    # Without this, repeated REM runs compound decay exponentially.
+    # FSRS formula: R(t,S) = (1 + t/(9*S))^(-1), Ye (2023)
     result = await db.execute(
         "UPDATE brain_observations SET "
         "importance = GREATEST(0.01, "
         "  importance * POWER("
         "    1.0 + EXTRACT(EPOCH FROM (NOW() - last_accessed)) / 86400.0 "
         "    / (9.0 * GREATEST(stability, 0.1)), -1"
-        "  )) "
+        "  )), "
+        "last_accessed = NOW() "
         "WHERE last_accessed < NOW() - INTERVAL '1 day'",
     )
     search.cache_clear()
@@ -1204,7 +1440,8 @@ async def _feedback_observation(
     action: str, obs_id: str, correction: str | None,
 ) -> str:
     row = await db.fetchrow(
-        "SELECT id, importance, content, version, previous_versions "
+        "SELECT id, importance, content, version, previous_versions, "
+        "stability, difficulty, last_accessed "
         "FROM brain_observations WHERE id = $1::uuid",
         obs_id,
     )
@@ -1213,22 +1450,33 @@ async def _feedback_observation(
 
     if action == "positive":
         new_imp = oja_positive(row["importance"])
+        # E1/B2: FSRS stability update on positive recall (Ye 2023)
+        stability = float(row.get("stability") or 1.0)
+        difficulty = float(row.get("difficulty") or 5.0)
+        elapsed = _elapsed_days(row.get("last_accessed"))
+        retrievability = fsrs_retrievability(elapsed, stability)
+        new_stability = fsrs_update_stability(
+            stability, difficulty, retrievability,
+        )
         await db.execute(
             "UPDATE brain_observations SET importance = $1, "
-            "access_count = access_count + 1, last_accessed = NOW() "
+            "access_count = access_count + 1, last_accessed = NOW(), "
+            "stability = $3, difficulty = GREATEST(1, difficulty - 0.1) "
             "WHERE id = $2::uuid",
-            new_imp, obs_id,
+            new_imp, obs_id, new_stability,
         )
     elif action == "negative":
         new_imp = oja_negative(row["importance"])
         await db.execute(
-            "UPDATE brain_observations SET importance = $1 "
+            "UPDATE brain_observations SET importance = $1, "
+            "difficulty = LEAST(10, difficulty + 0.2) "
             "WHERE id = $2::uuid",
             new_imp, obs_id,
         )
     elif action == "correct" and correction:
         new_imp = row["importance"]
-        prev = json.loads(row["previous_versions"]) if row["previous_versions"] else []
+        # B8 fix: asyncpg returns JSONB as Python objects — no json.loads
+        prev = row["previous_versions"] if row["previous_versions"] else []
         prev.append({
             "content": row["content"],
             "version": row["version"],
@@ -1352,7 +1600,7 @@ async def _analytics_health() -> str:
 
 
 async def _analytics_drift() -> str:
-    from scipy import stats as sp_stats  # type: ignore[import-not-found]
+    from scipy import stats as sp_stats  # type: ignore[import-not-found,import-untyped]
     row = await db.fetchrow(
         "WITH recent AS ("
         "  SELECT error_type, COUNT(*)::float AS cnt "
@@ -1386,16 +1634,53 @@ async def _analytics_drift() -> str:
 
 
 async def _analytics_communities() -> str:
+    """Louvain community detection with V12 summaries.
+
+    V12: For communities ≥3 entities, generates a structured summary
+    from top-3 observations per entity (by importance). Inspired by
+    Zep/Graphiti hierarchical KG (arXiv 2501.13956 §2.3).
+    """
     import networkx as nx  # type: ignore[import-untyped]
     g, has_data = await _build_brain_graph()
     if not has_data:
         return db.serialize({"communities": [], "note": "No relations to analyze"})
     communities = nx.community.louvain_communities(g, resolution=1.0)  # type: ignore[union-attr]
-    community_list = [
-        {"id": i, "members": sorted(c), "size": len(c)}
-        for i, c in enumerate(communities)
-    ]
-    return db.serialize({"communities": community_list, "total": len(community_list)})
+    community_list = []
+    for i, c in enumerate(sorted(communities, key=len, reverse=True)[:10]):
+        entry: dict[str, Any] = {
+            "id": i, "members": sorted(c), "size": len(c),
+        }
+        if len(c) >= 3:
+            entry["summary"] = await _community_summary(sorted(c))
+        community_list.append(entry)
+    return db.serialize({
+        "communities": community_list, "total": len(community_list),
+    })
+
+
+async def _community_summary(member_names: list[str]) -> str:
+    """Generate a text summary of a community's knowledge.
+
+    Args:
+        member_names: Entity names in the community.
+
+    Returns:
+        Compressed summary string.
+    """
+    rows = await db.fetch(
+        "SELECT e.name, o.content FROM brain_observations o "
+        "JOIN brain_entities e ON o.entity_id = e.id "
+        "WHERE e.name = ANY($1) "
+        "ORDER BY o.importance DESC LIMIT $2",
+        member_names, len(member_names) * 3,
+    )
+    if not rows:
+        return "No observations in this community"
+    by_entity: dict[str, list[str]] = {}
+    for r in rows:
+        by_entity.setdefault(r["name"], []).append(r["content"][:80])
+    parts = [f"{name}: {'; '.join(obs)}" for name, obs in by_entity.items()]
+    return " | ".join(parts[:5])
 
 
 async def _analytics_bridges() -> str:

@@ -98,7 +98,6 @@ async def get_pool() -> asyncpg.Pool:
             command_timeout=30,
             statement_cache_size=512,
             init=_init_connection,
-            setup=_init_connection,
         )
         return _pool
 
@@ -175,14 +174,19 @@ async def fetchval(query: str, *args: Any) -> Any:
             return await conn.fetchval(query, *args)
 
 async def close() -> None:
+    """Close the connection pool gracefully.
+
+    V15: Atomically swaps _pool to None before close to prevent
+    callers from getting a closing pool (race condition fix).
+    """
     global _pool
-    if _pool is not None:
+    pool, _pool = _pool, None  # Atomic swap
+    if pool is not None:
         try:
-            await asyncio.wait_for(_pool.close(), timeout=5.0)
+            await asyncio.wait_for(pool.close(), timeout=5.0)
         except asyncio.TimeoutError:
             logger.warning("Pool close timed out, terminating")
-            _pool.terminate()
-        _pool = None
+            pool.terminate()
 
 
 async def rebuild_tfidf_index() -> int:
@@ -227,7 +231,7 @@ async def rebuild_embeddings(batch_size: int = 50) -> int:
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         texts = [r["content"] for r in batch]
-        vecs = embeddings.embed(texts)
+        vecs = await embeddings.embed_async(texts)
         for j, vec in enumerate(vecs):
             await execute(
                 "UPDATE brain_observations SET embedding = $1 WHERE id = $2",
