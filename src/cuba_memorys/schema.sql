@@ -1,4 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS brain_entities (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -94,6 +95,10 @@ CREATE INDEX IF NOT EXISTS idx_relations_to ON brain_relations(to_entity);
 CREATE INDEX IF NOT EXISTS idx_obs_valid_until
     ON brain_observations(valid_until)
     WHERE valid_until IS NOT NULL;
+-- v2.1: Partial GIN index excluding superseded — avoids scanning obsolete rows
+CREATE INDEX IF NOT EXISTS idx_obs_active_search
+    ON brain_observations USING GIN(search_vector)
+    WHERE observation_type != 'superseded';
 DO $$ BEGIN
     ALTER TABLE brain_observations ADD COLUMN IF NOT EXISTS version INT DEFAULT 1;
     ALTER TABLE brain_observations ADD COLUMN IF NOT EXISTS previous_versions JSONB DEFAULT '[]';
@@ -113,5 +118,9 @@ DO $$ BEGIN
             'fact', 'decision', 'lesson', 'preference',
             'error', 'solution', 'context', 'tool_usage', 'superseded'
         ));
+    -- v2.1: HNSW index for ANN vector search — O(n) → O(log n)
+    CREATE INDEX IF NOT EXISTS idx_obs_embedding_hnsw
+        ON brain_observations USING hnsw ((embedding::vector(384)) vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64);
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;

@@ -71,7 +71,7 @@ class TestValidEntityTypes:
 
     def test_expected_types(self) -> None:
         """🟢 Contains all expected types."""
-        expected = {"concept", "project", "technology", "person", "pattern", "config"}
+        expected = {"concept", "project", "technology", "person", "pattern", "config", "system"}
         assert VALID_ENTITY_TYPES == expected
 
     def test_all_lowercase(self) -> None:
