@@ -1,5 +1,5 @@
--- cuba-memorys schema v2.0.0 (Rust rewrite)
--- Based on v1.6.0 + Dual-Strength Model (Bjork 1992)
+-- cuba-memorys schema v2.1.0 (FSRS-6 w20, Adaptive RRF, HNSW tuning)
+-- Based on v2.0.0 + Dual-Strength Model (Bjork 1992)
 
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
