@@ -1,0 +1,132 @@
+//! §A: Weighted RRF Entropy Routing.
+//!
+//! Reciprocal Rank Fusion with Shannon entropy-based dynamic weighting.
+//! V2: Post-fusion dedup removes semantic duplicates across signals.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::constants::RRF_K;
+
+/// A ranked search result.
+#[derive(Clone, Debug)]
+pub struct RankedResult {
+    pub id: String,
+    pub content: String,
+    pub score: f64,
+    pub source: String, // Which signal produced this
+}
+
+/// §A: Compute Shannon entropy of query for dynamic weight routing.
+pub fn query_entropy(query: &str) -> f64 {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let total = words.len();
+    if total == 0 {
+        return 0.0;
+    }
+    let unique: HashSet<&str> = words.iter().copied().collect();
+    let mut entropy = 0.0;
+    for word in &unique {
+        let freq = words.iter().filter(|w| *w == word).count() as f64 / total as f64;
+        if freq > 0.0 {
+            entropy -= freq * freq.log2();
+        }
+    }
+    entropy
+}
+
+/// RRF fusion across N ranked signal lists.
+///
+/// Each signal can have a custom weight (§A: entropy-based).
+pub fn fuse(
+    signals: &[(Vec<RankedResult>, f64)], // (results, weight)
+    dedup_threshold: f64,
+) -> Vec<RankedResult> {
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    let mut items: HashMap<String, RankedResult> = HashMap::new();
+
+    for (results, weight) in signals {
+        for (rank, result) in results.iter().enumerate() {
+            let rrf_score = weight / (RRF_K + rank as f64 + 1.0);
+            *scores.entry(result.id.clone()).or_default() += rrf_score;
+            items.entry(result.id.clone()).or_insert_with(|| result.clone());
+        }
+    }
+
+    // Sort by fused score
+    let mut sorted: Vec<(String, f64)> = scores.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // V2: Post-fusion dedup by content overlap
+    let mut unique: Vec<RankedResult> = Vec::new();
+    for (id, score) in sorted {
+        if let Some(mut item) = items.remove(&id) {
+            let is_dup = unique.iter().any(|existing| {
+                text_overlap(&item.content, &existing.content) > dedup_threshold
+            });
+            if !is_dup {
+                item.score = score;
+                unique.push(item);
+            }
+        }
+    }
+
+    unique
+}
+
+/// V2: Word-overlap ratio (Jaccard-like with min denominator).
+fn text_overlap(a: &str, b: &str) -> f64 {
+    let lower_a = a.to_lowercase();
+    let lower_b = b.to_lowercase();
+    let words_a: HashSet<&str> = lower_a.split_whitespace().collect();
+    let words_b: HashSet<&str> = lower_b.split_whitespace().collect();
+    if words_a.is_empty() || words_b.is_empty() {
+        return 0.0;
+    }
+    let intersection = words_a.intersection(&words_b).count();
+    intersection as f64 / words_a.len().min(words_b.len()) as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_query_entropy_uniform() {
+        // All unique words → high entropy
+        let e = query_entropy("rust is fast and safe for systems programming");
+        assert!(e > 2.5, "diverse query should have high entropy: got {e}");
+    }
+
+    #[test]
+    fn test_query_entropy_repetitive() {
+        let e = query_entropy("hello hello hello");
+        assert!(e < 0.01, "repetitive query should have near-zero entropy: got {e}");
+    }
+
+    #[test]
+    fn test_text_overlap_identical() {
+        assert!((text_overlap("hello world", "hello world") - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_text_overlap_disjoint() {
+        assert_eq!(text_overlap("hello world", "foo bar"), 0.0);
+    }
+
+    #[test]
+    fn test_rrf_fusion_basic() {
+        let signal1 = vec![
+            RankedResult { id: "a".into(), content: "alpha".into(), score: 0.0, source: "text".into() },
+            RankedResult { id: "b".into(), content: "beta".into(), score: 0.0, source: "text".into() },
+        ];
+        let signal2 = vec![
+            RankedResult { id: "b".into(), content: "beta".into(), score: 0.0, source: "vec".into() },
+            RankedResult { id: "c".into(), content: "gamma".into(), score: 0.0, source: "vec".into() },
+        ];
+
+        let fused = fuse(&[(signal1, 0.5), (signal2, 0.5)], 0.75);
+        assert!(!fused.is_empty());
+        // "b" appears in both signals, should rank higher
+        assert_eq!(fused[0].id, "b", "item in both signals should rank first");
+    }
+}

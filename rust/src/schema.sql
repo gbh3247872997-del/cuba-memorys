@@ -1,4 +1,6 @@
--- cuba-memorys schema v1.6.0
+-- cuba-memorys schema v2.0.0 (Rust rewrite)
+-- Based on v1.6.0 + Dual-Strength Model (Bjork 1992)
+
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -36,13 +38,16 @@ CREATE TABLE IF NOT EXISTS brain_observations (
     source_id TEXT,
     version INT DEFAULT 1,
     previous_versions JSONB DEFAULT '[]',
-    -- FSRS decay model (Ye 2023)
+    -- FSRS-6 decay model (Ye 2024, ADR-001: custom implementation)
     stability FLOAT DEFAULT 1.0,
     difficulty FLOAT DEFAULT 5.0,
+    -- Dual-Strength Model (Bjork & Bjork 1992, ADR-002: v1.0)
+    storage_strength FLOAT DEFAULT 0.5,
+    retrieval_strength FLOAT DEFAULT 1.0,
     -- Temporal validity for data lifecycle
     valid_from TIMESTAMPTZ DEFAULT NOW(),
     valid_until TIMESTAMPTZ,
-    -- Semantic embedding (pgvector required — guaranteed by pgvector/pgvector Docker image)
+    -- Semantic embedding (pgvector — 384d BGE-small)
     embedding vector(384),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     search_vector tsvector GENERATED ALWAYS AS (
@@ -94,7 +99,7 @@ CREATE TABLE IF NOT EXISTS brain_sessions (
     ended_at TIMESTAMPTZ
 );
 
--- ── Indexes (after all columns exist) ──────────────────────────────
+-- ── Indexes ──────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_entities_search ON brain_entities USING GIN(search_vector);
 CREATE INDEX IF NOT EXISTS idx_entities_trgm ON brain_entities USING GIN(name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_entities_type ON brain_entities(entity_type);
@@ -109,14 +114,17 @@ CREATE INDEX IF NOT EXISTS idx_errors_project ON brain_errors(project);
 CREATE INDEX IF NOT EXISTS idx_errors_resolved ON brain_errors(resolved);
 CREATE INDEX IF NOT EXISTS idx_relations_from ON brain_relations(from_entity);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON brain_relations(to_entity);
+
 -- Partial index for temporal validity filter
 CREATE INDEX IF NOT EXISTS idx_obs_valid_until
     ON brain_observations(valid_until)
     WHERE valid_until IS NOT NULL;
+
 -- Partial GIN index excluding superseded — avoids scanning obsolete rows
 CREATE INDEX IF NOT EXISTS idx_obs_active_search
     ON brain_observations USING GIN(search_vector)
     WHERE observation_type != 'superseded';
+
 -- HNSW index for ANN vector search — O(log n) cosine similarity
 CREATE INDEX IF NOT EXISTS idx_obs_embedding_hnsw
     ON brain_observations USING hnsw (embedding vector_cosine_ops)

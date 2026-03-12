@@ -102,45 +102,23 @@ async def get_pool() -> asyncpg.Pool:
         return _pool
 
 async def init_schema() -> None:
+    """Initialize database schema and detect pgvector availability.
+
+    The schema.sql defines embedding as vector(384) directly
+    (pgvector guaranteed by pgvector/pgvector Docker image).
+    """
     global _pgvector_available
     pool = await get_pool()
     schema_sql = resources.files("cuba_memorys").joinpath("schema.sql").read_text()
     async with pool.acquire() as conn:
         await conn.execute(schema_sql)
 
-        # Detect pgvector extension
+        # Detect pgvector extension (created by schema.sql)
         ext = await conn.fetchval(
             "SELECT 1 FROM pg_extension WHERE extname = 'vector'",
         )
         if ext:
             _pgvector_available = True
-            # Migrate embedding column from float4[] to vector(384)
-            col_type = await conn.fetchval(
-                "SELECT data_type FROM information_schema.columns "
-                "WHERE table_name = 'brain_observations' "
-                "AND column_name = 'embedding'",
-            )
-            if col_type and col_type != "USER-DEFINED":
-                await conn.execute(
-                    "ALTER TABLE brain_observations "
-                    "DROP COLUMN IF EXISTS embedding",
-                )
-                await conn.execute(
-                    "ALTER TABLE brain_observations "
-                    "ADD COLUMN embedding vector(384)",
-                )
-                logger.info("Migrated embedding column to vector(384)")
-            elif not col_type:
-                await conn.execute(
-                    "ALTER TABLE brain_observations "
-                    "ADD COLUMN IF NOT EXISTS embedding vector(384)",
-                )
-            # HNSW index for cosine similarity
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_obs_embedding_hnsw "
-                "ON brain_observations USING hnsw (embedding vector_cosine_ops) "
-                "WITH (m = 16, ef_construction = 64)",
-            )
             logger.info("pgvector active — HNSW index ready (384d)")
         else:
             logger.info("pgvector not installed — using TF-IDF + trigrams")

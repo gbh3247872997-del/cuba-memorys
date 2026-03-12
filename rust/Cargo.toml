@@ -1,0 +1,62 @@
+[package]
+name = "cuba-memorys"
+version = "2.0.0"
+edition = "2024"
+description = "Knowledge Graph MCP Server — Rust rewrite with FSRS-6 + Dual-Strength"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# PostgreSQL (compile-time checked, async, built-in pool retry)
+sqlx = { version = "0.8", features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Graph algorithms
+petgraph = "0.7"
+
+# Embeddings (ONNX Runtime) — RC until stable release
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+tokenizers = "0.21"
+
+# Logging (structured, to stderr)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Types
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Cache (O(1) LRU eviction)
+lru = "0.12"
+
+# Global allocator
+mimalloc = "0.1"
+
+# Hashing (relation dedup — E-WL inspired triple hash)
+blake3 = "1"
+
+# Misc
+rand = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

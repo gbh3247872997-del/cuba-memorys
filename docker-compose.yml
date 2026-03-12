@@ -4,7 +4,7 @@ name: cuba-memorys
 
 services:
   postgres:
-    image: postgres:18-alpine
+    image: pgvector/pgvector:pg18
     container_name: cuba-memorys-db
     restart: always
     environment:
@@ -14,7 +14,7 @@ services:
     ports:
       - "5488:5432"  # Puerto único para evitar conflictos
     volumes:
-      - cuba_data:/var/lib/postgresql/data
+      - cuba_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cuba -d brain"]
       interval: 10s
